@@ -186,6 +186,24 @@
   </div>
 </div>
 
+<div id="editModModal" class="modal hidden">
+  <div class="modal-card">
+    <h2>Edit moderator</h2>
+    <form id="editModForm">
+      <input type="hidden" id="editModId" />
+      <input id="editModUsername" type="text" placeholder="Username" required />
+      <select id="editModRole">
+        <option value="moderator">Moderator</option>
+        <option value="admin">Admin</option>
+      </select>
+      <div class="modal-actions">
+        <button type="button" id="editModCancel" class="ghost-btn">Cancel</button>
+        <button type="submit" class="btn">Save changes</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <div id="newKeyModal" class="modal hidden">
   <div class="modal-card">
     <h2>Moderator created</h2>
