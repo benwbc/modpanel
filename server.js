@@ -1,574 +1,532 @@
-// Roblox Moderation Panel API
-//
-// Talks to three kinds of clients:
-//   1. Your Roblox game server (Adminhandler script) — POSTs violations from
-//      the anti-cheat, polls for pending ban/kick/unban actions, and acks them.
-//      Authenticates with the GAME_API_KEY env var via X-API-Key header.
-//   2. The dashboard in /public — one login per moderator (X-Mod-Key header),
-//      so access can be granted/revoked per person instead of one shared secret.
-//   3. Roblox's public Users/Thumbnails APIs and (optionally) the Open Cloud
-//      Data Stores API — outbound calls this server makes on the dashboard's
-//      behalf so the Roblox lookup key/Open Cloud key never reach the browser.
-//
-// Storage is flat JSON files under ./data. That's intentional: zero setup,
-// works fine on Render's free tier for a hobby project. Render's free disk
-// is NOT guaranteed to persist across a redeploy — see README.md if you
-// want a real database later (Supabase's free Postgres tier is the natural
-// upgrade; swap the readJSON/writeJSON helpers, the rest of the API doesn't
-// need to change).
+// Sentinel — Roblox Moderation Panel
+// Full implementation matching README.md's API reference.
 
 const express = require("express");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
+const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
+const https = require("https");
 
 const app = express();
-app.disable("x-powered-by");
-app.set("trust proxy", 1); // Render sits behind a proxy; needed for correct req.ip
-app.use(
-  helmet({
-    // A real CSP instead of none: this dashboard is a single static file with
-    // one inline <script>/<style> block (no build step), so script-src/style-src
-    // need 'unsafe-inline' — but everything else is locked to 'self', which still
-    // blocks any third-party script/iframe/object from ever running here.
-    contentSecurityPolicy: {
-      directives: {
-        defaultSrc: ["'self'"],
-        scriptSrc: ["'self'", "'unsafe-inline'"],
-        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
-        fontSrc: ["'self'", "https://fonts.gstatic.com"],
-        imgSrc: ["'self'", "data:", "https://*.rbxcdn.com", "https://thumbnails.roblox.com"],
-        connectSrc: ["'self'"],
-        objectSrc: ["'none'"],
-        frameAncestors: ["'none'"],
-        baseUri: ["'self'"],
-        formAction: ["'self'"],
-      },
-    },
-    frameguard: { action: "deny" },
-    referrerPolicy: { policy: "no-referrer" },
-  })
-);
-app.use(express.json({ limit: "1mb" }));
-
-// No CORS headers are set anywhere below, so browsers block cross-origin
-// reads by default. If you deliberately want to call this API from another
-// origin, set ALLOWED_ORIGIN and uncomment the block — leave it unset otherwise.
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "";
-if (ALLOWED_ORIGIN) {
-  app.use((req, res, next) => {
-    res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
-    res.setHeader("Vary", "Origin");
-    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-Mod-Key, X-API-Key");
-    res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
-    if (req.method === "OPTIONS") return res.sendStatus(204);
-    next();
-  });
-}
-
 const PORT = process.env.PORT || 3000;
-const GAME_API_KEY = process.env.GAME_API_KEY || process.env.API_KEY || ""; // API_KEY kept as a fallback name for anyone upgrading from the old single-key version
-const PLACE_ID = process.env.PLACE_ID || "";
-const UNIVERSE_ID = process.env.UNIVERSE_ID || "";
-const GAME_NAME = process.env.GAME_NAME || "";
-const OPEN_CLOUD_API_KEY = process.env.OPEN_CLOUD_API_KEY || "";
-const DATASTORE_NAME = process.env.DATASTORE_NAME || "";
-const DATASTORE_KEY_TEMPLATE = process.env.DATASTORE_KEY_TEMPLATE || "{userId}";
 
 const DATA_DIR = path.join(__dirname, "data");
 const VIOLATIONS_FILE = path.join(DATA_DIR, "violations.json");
 const ACTIONS_FILE = path.join(DATA_DIR, "actions.json");
 const MODERATORS_FILE = path.join(DATA_DIR, "moderators.json");
+const HEARTBEAT_FILE = path.join(DATA_DIR, "heartbeat.json");
 
-const MAX_VIOLATIONS_STORED = 5000;
-const ACTION_RESEND_AFTER_MS = 60 * 1000; // if a "sent" action isn't acked in 60s, resend it
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// ---------------------------------------------------------------
-// tiny JSON-file storage helpers
-// ---------------------------------------------------------------
-function ensureDataFiles() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(VIOLATIONS_FILE)) fs.writeFileSync(VIOLATIONS_FILE, "[]");
-  if (!fs.existsSync(ACTIONS_FILE)) fs.writeFileSync(ACTIONS_FILE, "[]");
-  if (!fs.existsSync(MODERATORS_FILE)) fs.writeFileSync(MODERATORS_FILE, "[]");
-}
-function readJSON(file) {
+function readJSON(file, fallback) {
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8"));
-  } catch {
-    return [];
+    if (!fs.existsSync(file)) return fallback;
+    const raw = fs.readFileSync(file, "utf8");
+    if (!raw.trim()) return fallback;
+    return JSON.parse(raw);
+  } catch (err) {
+    console.error(`[Sentinel] Failed to read ${file}:`, err.message);
+    return fallback;
   }
 }
+
 function writeJSON(file, data) {
-  fs.writeFileSync(file, JSON.stringify(data, null, 2));
-}
-ensureDataFiles();
-
-// ---------------------------------------------------------------
-// auth helpers
-// ---------------------------------------------------------------
-function hashKey(key) {
-  return crypto.createHash("sha256").update(String(key)).digest("hex");
-}
-function safeEqualHex(a, b) {
-  const bufA = Buffer.from(String(a), "utf8");
-  const bufB = Buffer.from(String(b), "utf8");
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
+  try {
+    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+  } catch (err) {
+    console.error(`[Sentinel] Failed to write ${file}:`, err.message);
+  }
 }
 
-// in-memory brute-force lockout, per IP, on top of the rate limiter below
-const failedAttempts = new Map(); // ip -> { count, lockedUntil }
-const LOCKOUT_THRESHOLD = 8;
-const LOCKOUT_WINDOW_MS = 5 * 60 * 1000;
-function isLockedOut(ip) {
-  const rec = failedAttempts.get(ip);
-  return !!(rec && rec.lockedUntil && rec.lockedUntil > Date.now());
-}
-function registerFailure(ip) {
-  const rec = failedAttempts.get(ip) || { count: 0, lockedUntil: 0 };
-  rec.count += 1;
-  if (rec.count >= LOCKOUT_THRESHOLD) {
-    rec.lockedUntil = Date.now() + LOCKOUT_WINDOW_MS;
-    rec.count = 0;
-  }
-  failedAttempts.set(ip, rec);
-}
-function registerSuccess(ip) {
-  failedAttempts.delete(ip);
-}
-setInterval(() => {
-  const now = Date.now();
-  for (const [ip, rec] of failedAttempts) {
-    if (!rec.lockedUntil || rec.lockedUntil < now) failedAttempts.delete(ip);
-  }
-}, 10 * 60 * 1000).unref();
+// ============================================================
+// CONFIG
+// ============================================================
+const GAME_API_KEY = process.env.GAME_API_KEY;
+const PLACE_ID = process.env.PLACE_ID || "";
+const UNIVERSE_ID = process.env.UNIVERSE_ID || "";
+const GAME_NAME = process.env.GAME_NAME || "Roblox Game";
+const OPEN_CLOUD_API_KEY = process.env.OPEN_CLOUD_API_KEY || "";
+const DATASTORE_NAME = process.env.DATASTORE_NAME || "";
+const DATASTORE_KEY_TEMPLATE = process.env.DATASTORE_KEY_TEMPLATE || "{userId}";
+const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "";
 
-// game server auth — only for the three /api routes the Adminhandler script calls
-function requireGameKey(req, res, next) {
-  if (!GAME_API_KEY) {
-    return res.status(500).json({ error: "Server misconfigured: GAME_API_KEY is not set." });
-  }
-  if (isLockedOut(req.ip)) {
-    return res.status(429).json({ error: "Too many failed attempts from this address. Try again later." });
-  }
-  const key = req.header("X-API-Key");
-  if (!key || !safeEqualHex(hashKey(key), hashKey(GAME_API_KEY))) {
-    registerFailure(req.ip);
-    return res.status(401).json({ error: "Invalid or missing X-API-Key header." });
-  }
-  registerSuccess(req.ip);
-  next();
+if (!GAME_API_KEY) {
+  console.error("[Sentinel] FATAL: GAME_API_KEY environment variable is required.");
+  console.error("[Sentinel] Generate one with: openssl rand -hex 24");
+  process.exit(1);
 }
 
-// dashboard auth — every moderator has their own key, so access can be
-// revoked individually and every action is attributed to a person.
-function requireMod(minRole) {
-  return (req, res, next) => {
-    if (isLockedOut(req.ip)) {
-      return res.status(429).json({ error: "Too many failed attempts from this address. Try again later." });
-    }
-    const key = req.header("X-Mod-Key");
-    if (!key) {
-      return res.status(401).json({ error: "Missing X-Mod-Key header." });
-    }
-    const mods = readJSON(MODERATORS_FILE);
-    const keyHash = hashKey(key);
-    const mod = mods.find((m) => safeEqualHex(m.keyHash, keyHash));
-    if (!mod) {
-      registerFailure(req.ip);
-      return res.status(401).json({ error: "Invalid moderator key." });
-    }
-    registerSuccess(req.ip);
-    if (minRole === "admin" && mod.role !== "admin") {
-      return res.status(403).json({ error: "This action requires the admin role." });
-    }
-    req.moderator = { id: mod.id, username: mod.username, role: mod.role };
+// ============================================================
+// SECURITY MIDDLEWARE
+// ============================================================
+app.use(helmet());
+app.use(express.json({ limit: "256kb" }));
+
+if (ALLOWED_ORIGIN) {
+  app.use((req, res, next) => {
+    res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-API-Key, X-Mod-Key");
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    if (req.method === "OPTIONS") return res.sendStatus(204);
     next();
-  };
-}
-
-function ensureBootstrapAdmin() {
-  const mods = readJSON(MODERATORS_FILE);
-  if (mods.length > 0) return;
-  const username = process.env.ADMIN_USERNAME || "admin";
-  const key = process.env.ADMIN_KEY || crypto.randomBytes(24).toString("hex");
-  mods.push({
-    id: crypto.randomUUID(),
-    username,
-    role: "admin",
-    keyHash: hashKey(key),
-    createdAt: Date.now(),
   });
-  writeJSON(MODERATORS_FILE, mods);
-  console.log("=".repeat(72));
-  console.log("No moderators exist yet — created a bootstrap admin account:");
-  console.log("  Username: " + username);
-  console.log("  Key:      " + key);
-  if (!process.env.ADMIN_KEY) {
-    console.log("  (This key was randomly generated because ADMIN_KEY isn't set.");
-    console.log("   It's stored only as a hash — copy it now, it won't be shown again.");
-    console.log("   Set ADMIN_KEY in your environment to control it instead.)");
-  }
-  console.log("Log in with these on the dashboard, then add your team from Settings → Moderators.");
-  console.log("=".repeat(72));
 }
-ensureBootstrapAdmin();
 
-// general throttle across the whole API, generous enough for normal polling
-// (dashboard refreshes every ~6s, the game polls every ~10s) but a real
-// ceiling against scripted abuse.
 app.use(
-  "/api/",
   rateLimit({
-    windowMs: 5 * 60 * 1000,
-    limit: 600,
+    windowMs: 60 * 1000,
+    max: 120,
     standardHeaders: true,
     legacyHeaders: false,
   })
 );
 
-app.get("/api/health", (req, res) => res.json({ ok: true }));
+app.use(express.static(path.join(__dirname, "public")));
 
-// Tighter limiter specifically for key-checking endpoints (login, adding a
-// moderator). These are the routes a brute-force attempt actually targets,
-// so on top of the per-IP lockout above, cap how fast they can even be tried.
-const authLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 20,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: "Too many requests. Slow down and try again shortly." },
-});
-
-// Small helper: reject fields that are the wrong type or absurdly long,
-// instead of silently truncating/coercing them into the JSON store.
-function badLength(value, max) {
-  return typeof value === "string" && value.length > max;
+// ---- hashing / timing-safe comparison helpers ----
+function sha256(value) {
+  return crypto.createHash("sha256").update(value, "utf8").digest("hex");
 }
 
-// ---------------------------------------------------------------
-// AUTH / MODERATORS
-// ---------------------------------------------------------------
+function timingSafeEqualHex(hexA, hexB) {
+  if (typeof hexA !== "string" || typeof hexB !== "string") return false;
+  const a = Buffer.from(hexA, "hex");
+  const b = Buffer.from(hexB, "hex");
+  if (a.length !== b.length) return false;
+  return crypto.timingSafeEqual(a, b);
+}
 
-// Dashboard -> here, right after login, to confirm the key and get identity + config.
-app.get("/api/me", authLimiter, requireMod("moderator"), (req, res) => {
-  res.json({
-    moderator: req.moderator,
-    settings: {
-      placeId: PLACE_ID || null,
-      universeId: UNIVERSE_ID || null,
-      gameName: GAME_NAME || null,
-      openCloudConfigured: !!(OPEN_CLOUD_API_KEY && UNIVERSE_ID && DATASTORE_NAME),
-      gameKeyConfigured: !!GAME_API_KEY,
-    },
-  });
-});
+function generateKey() {
+  return crypto.randomBytes(24).toString("hex");
+}
 
-app.get("/api/moderators", requireMod("admin"), (req, res) => {
-  const mods = readJSON(MODERATORS_FILE).map(({ id, username, role, createdAt }) => ({
-    id,
-    username,
-    role,
-    createdAt,
-  }));
-  res.json(mods);
-});
+// ---- per-IP lockout on repeated bad keys ----
+const failedAttempts = new Map(); // ip -> { count, lockedUntil }
+const LOCKOUT_THRESHOLD = 5;
+const LOCKOUT_MS = 5 * 60 * 1000;
 
-app.post("/api/moderators", authLimiter, requireMod("admin"), (req, res) => {
-  const { username, role } = req.body || {};
-  if (!username || typeof username !== "string" || !username.trim()) {
-    return res.status(400).json({ error: "username is required." });
+function isLockedOut(ip) {
+  const entry = failedAttempts.get(ip);
+  if (!entry) return false;
+  if (entry.lockedUntil && entry.lockedUntil > Date.now()) return true;
+  if (entry.lockedUntil && entry.lockedUntil <= Date.now()) failedAttempts.delete(ip);
+  return false;
+}
+
+function recordFailure(ip) {
+  const entry = failedAttempts.get(ip) || { count: 0, lockedUntil: 0 };
+  entry.count += 1;
+  if (entry.count >= LOCKOUT_THRESHOLD) {
+    entry.lockedUntil = Date.now() + LOCKOUT_MS;
+    entry.count = 0;
   }
-  if (badLength(username, 40)) {
-    return res.status(400).json({ error: "username is too long (40 characters max)." });
-  }
-  if (!/^[a-zA-Z0-9_. #-]+$/.test(username.trim())) {
-    return res.status(400).json({ error: "username may only contain letters, numbers, spaces, and _ . - #" });
-  }
-  const safeRole = role === "admin" ? "admin" : "moderator";
-  const mods = readJSON(MODERATORS_FILE);
-  if (mods.some((m) => m.username.toLowerCase() === username.trim().toLowerCase())) {
-    return res.status(409).json({ error: "A moderator with that username already exists." });
-  }
-  const key = crypto.randomBytes(24).toString("hex");
-  const mod = {
+  failedAttempts.set(ip, entry);
+}
+
+function recordSuccess(ip) {
+  failedAttempts.delete(ip);
+}
+
+// ============================================================
+// MODERATOR STORE
+// ============================================================
+let moderators = readJSON(MODERATORS_FILE, []);
+
+function saveModerators() {
+  writeJSON(MODERATORS_FILE, moderators);
+}
+
+function bootstrapAdminIfNeeded() {
+  if (moderators.length > 0) return;
+
+  const username = process.env.ADMIN_USERNAME || "admin";
+  const key = process.env.ADMIN_KEY || generateKey();
+
+  moderators.push({
     id: crypto.randomUUID(),
-    username: username.trim(),
-    role: safeRole,
-    keyHash: hashKey(key),
-    createdAt: Date.now(),
-    createdBy: req.moderator.username,
-  };
-  mods.push(mod);
-  writeJSON(MODERATORS_FILE, mods);
-  // the raw key is only ever returned here, once — copy it to the new moderator securely
-  res.status(201).json({ id: mod.id, username: mod.username, role: mod.role, createdAt: mod.createdAt, key });
-});
+    username,
+    keyHash: sha256(key),
+    role: "admin",
+    createdAt: new Date().toISOString(),
+  });
+  saveModerators();
 
-app.delete("/api/moderators/:id", requireMod("admin"), (req, res) => {
-  const mods = readJSON(MODERATORS_FILE);
-  const target = mods.find((m) => m.id === req.params.id);
-  if (!target) return res.status(404).json({ error: "Moderator not found." });
-  const adminCount = mods.filter((m) => m.role === "admin").length;
-  if (target.role === "admin" && adminCount <= 1) {
-    return res.status(400).json({ error: "Can't remove the only remaining admin." });
+  console.log("============================================================");
+  console.log("[Sentinel] Bootstrap admin account created:");
+  console.log(`  Username: ${username}`);
+  console.log(`  Key:      ${key}`);
+  console.log("  This key is shown ONCE — store it in a password manager.");
+  console.log("============================================================");
+}
+bootstrapAdminIfNeeded();
+
+function findModeratorByKey(key) {
+  if (!key) return null;
+  const hash = sha256(key);
+  return moderators.find((m) => timingSafeEqualHex(m.keyHash, hash)) || null;
+}
+
+// ---- game auth (X-API-Key) ----
+function requireGameAuth(req, res, next) {
+  const ip = req.ip;
+  if (isLockedOut(ip)) return res.status(429).json({ error: "Too many failed attempts. Try again later." });
+
+  const key = req.header("X-API-Key");
+  if (!key || key !== GAME_API_KEY) {
+    recordFailure(ip);
+    return res.status(401).json({ error: "Invalid or missing X-API-Key." });
   }
-  writeJSON(MODERATORS_FILE, mods.filter((m) => m.id !== req.params.id));
-  res.json({ ok: true });
+  recordSuccess(ip);
+  next();
+}
+
+// ---- moderator auth (X-Mod-Key) ----
+function requireModAuth(req, res, next) {
+  const ip = req.ip;
+  if (isLockedOut(ip)) return res.status(429).json({ error: "Too many failed attempts. Try again later." });
+
+  const key = req.header("X-Mod-Key");
+  const mod = findModeratorByKey(key);
+  if (!mod) {
+    recordFailure(ip);
+    return res.status(401).json({ error: "Invalid or missing X-Mod-Key." });
+  }
+  recordSuccess(ip);
+  req.moderator = mod;
+  next();
+}
+
+function requireAdmin(req, res, next) {
+  if (req.moderator.role !== "admin") {
+    return res.status(403).json({ error: "Admin role required." });
+  }
+  next();
+}
+
+// ============================================================
+// VIOLATIONS
+// ============================================================
+let violations = readJSON(VIOLATIONS_FILE, []);
+const MAX_VIOLATIONS_STORED = 5000;
+
+function saveViolations() {
+  writeJSON(VIOLATIONS_FILE, violations);
+}
+
+app.get("/api/health", (req, res) => {
+  res.json({ status: "ok", time: new Date().toISOString() });
 });
 
-// ---------------------------------------------------------------
-// HEARTBEAT — proves the anti-cheat link is actually alive
-// ---------------------------------------------------------------
-const heartbeat = { lastViolationAt: null, lastActionPollAt: null };
-app.get("/api/heartbeat", requireMod("moderator"), (req, res) => res.json(heartbeat));
-
-// ---------------------------------------------------------------
-// VIOLATIONS  (anti-cheat integration)
-// ---------------------------------------------------------------
-
-// Roblox -> here. Called from Adminhandler's reportViolationToPanel().
-app.post("/api/violations", requireGameKey, (req, res) => {
+app.post("/api/violations", requireGameAuth, (req, res) => {
   const { userId, username, violationType, details, severity, jobId, placeId, timestamp } = req.body || {};
-
   if (!userId || !violationType) {
     return res.status(400).json({ error: "userId and violationType are required." });
   }
-  if (badLength(username, 60) || badLength(violationType, 120) || badLength(details, 2000)) {
-    return res.status(400).json({ error: "One of the fields is too long." });
-  }
 
-  const violations = readJSON(VIOLATIONS_FILE);
-  violations.push({
+  const entry = {
     id: crypto.randomUUID(),
     userId,
-    username: username || "Unknown",
+    username: username || String(userId),
     violationType,
     details: details || "",
     severity: severity === "ban" ? "ban" : "warning",
     jobId: jobId || null,
     placeId: placeId || PLACE_ID || null,
     timestamp: timestamp || Math.floor(Date.now() / 1000),
-    receivedAt: Date.now(),
-  });
+    receivedAt: new Date().toISOString(),
+  };
 
-  while (violations.length > MAX_VIOLATIONS_STORED) violations.shift();
+  violations.unshift(entry);
+  if (violations.length > MAX_VIOLATIONS_STORED) violations.length = MAX_VIOLATIONS_STORED;
+  saveViolations();
 
-  writeJSON(VIOLATIONS_FILE, violations);
-  heartbeat.lastViolationAt = Date.now();
-  res.status(201).json({ ok: true });
+  writeJSON(HEARTBEAT_FILE, { lastViolationAt: new Date().toISOString() });
+
+  res.json({ ok: true, id: entry.id });
 });
 
-// Dashboard -> here. Newest first, optional filters.
-app.get("/api/violations", requireMod("moderator"), (req, res) => {
-  let violations = readJSON(VIOLATIONS_FILE).slice().reverse();
-
+app.get("/api/violations", requireModAuth, (req, res) => {
   const { userId, severity, search, limit } = req.query;
-  if (userId) violations = violations.filter((v) => String(v.userId) === String(userId));
-  if (severity) violations = violations.filter((v) => v.severity === severity);
+  let results = violations;
+
+  if (userId) results = results.filter((v) => String(v.userId) === String(userId));
+  if (severity) results = results.filter((v) => v.severity === severity);
   if (search) {
     const q = String(search).toLowerCase();
-    violations = violations.filter(
+    results = results.filter(
       (v) =>
         v.username.toLowerCase().includes(q) ||
         v.violationType.toLowerCase().includes(q) ||
-        v.details.toLowerCase().includes(q)
+        (v.details || "").toLowerCase().includes(q)
     );
   }
 
-  const cap = Math.min(parseInt(limit, 10) || 200, 1000);
-  res.json(violations.slice(0, cap));
+  const cap = Math.min(parseInt(limit, 10) || 100, 1000);
+  res.json(results.slice(0, cap));
 });
 
-// ---------------------------------------------------------------
+// ============================================================
 // ACTIONS (ban / kick / unban queue)
-// ---------------------------------------------------------------
+// ============================================================
+let actions = readJSON(ACTIONS_FILE, []);
+const MAX_ACTIONS_STORED = 5000;
 
-// Dashboard -> here. Queues an action for the game server to pick up.
-app.post("/api/actions", requireMod("moderator"), (req, res) => {
-  const { type, userId, username, reason, notes, banLength } = req.body || {};
+function saveActions() {
+  writeJSON(ACTIONS_FILE, actions);
+}
+
+app.post("/api/actions", requireModAuth, (req, res) => {
+  const { type, userId, reason, notes, banLength } = req.body || {};
   if (!["ban", "kick", "unban"].includes(type) || !userId) {
-    return res.status(400).json({ error: "type must be ban/kick/unban, and userId is required." });
-  }
-  if (!/^[0-9]+$/.test(String(userId))) {
-    return res.status(400).json({ error: "userId must be a numeric Roblox ID — resolve the username first." });
-  }
-  if (badLength(username, 60) || badLength(reason, 300) || badLength(notes, 2000) || badLength(banLength, 40)) {
-    return res.status(400).json({ error: "One of the fields is too long." });
+    return res.status(400).json({ error: "type (ban|kick|unban) and userId are required." });
   }
 
-  const actions = readJSON(ACTIONS_FILE);
-  const action = {
+  const entry = {
     id: crypto.randomUUID(),
     type,
     userId,
-    username: username || "Unknown",
     reason: reason || "",
     notes: notes || "",
     banLength: banLength || null,
-    status: "pending", // pending -> sent -> done
-    createdAt: Date.now(),
-    sentAt: null,
     queuedBy: req.moderator.username,
+    queuedAt: new Date().toISOString(),
+    acknowledged: false,
   };
-  actions.push(action);
-  writeJSON(ACTIONS_FILE, actions);
-  res.status(201).json(action);
+
+  actions.unshift(entry);
+  if (actions.length > MAX_ACTIONS_STORED) actions.length = MAX_ACTIONS_STORED;
+  saveActions();
+
+  res.json({ ok: true, id: entry.id });
 });
 
-// Roblox -> here, polled every ~10s. Returns pending actions and marks
-// them "sent"; if never acked, they're resent after ACTION_RESEND_AFTER_MS
-// in case a server crashed mid-action.
-app.get("/api/actions/pending", requireGameKey, (req, res) => {
-  const actions = readJSON(ACTIONS_FILE);
-  const now = Date.now();
-
-  const due = actions.filter(
-    (a) => a.status === "pending" || (a.status === "sent" && now - a.sentAt > ACTION_RESEND_AFTER_MS)
-  );
-
-  due.forEach((a) => {
-    a.status = "sent";
-    a.sentAt = now;
+app.get("/api/actions/pending", requireGameAuth, (req, res) => {
+  const pending = actions.filter((a) => !a.acknowledged);
+  writeJSON(HEARTBEAT_FILE, {
+    ...readJSON(HEARTBEAT_FILE, {}),
+    lastPolledAt: new Date().toISOString(),
   });
-  writeJSON(ACTIONS_FILE, actions);
-  heartbeat.lastActionPollAt = Date.now();
-
-  res.json(due.map(({ id, type, userId, reason, notes, banLength }) => ({ id, type, userId, reason, notes, banLength })));
+  res.json(pending);
 });
 
-// Roblox -> here, after executing an action.
-app.post("/api/actions/ack", requireGameKey, (req, res) => {
+app.post("/api/actions/ack", requireGameAuth, (req, res) => {
   const { actionId } = req.body || {};
-  const actions = readJSON(ACTIONS_FILE);
-  const action = actions.find((a) => a.id === actionId);
-  if (action) {
-    action.status = "done";
-    action.doneAt = Date.now();
-    writeJSON(ACTIONS_FILE, actions);
+  const entry = actions.find((a) => a.id === actionId);
+  if (entry) {
+    entry.acknowledged = true;
+    entry.acknowledgedAt = new Date().toISOString();
+    saveActions();
   }
   res.json({ ok: true });
 });
 
-// Dashboard -> here, to show recent action history.
-app.get("/api/actions", requireMod("moderator"), (req, res) => {
+app.get("/api/actions", requireModAuth, (req, res) => {
   const { userId } = req.query;
-  let actions = readJSON(ACTIONS_FILE).slice().reverse();
-  if (userId) actions = actions.filter((a) => String(a.userId) === String(userId));
-  res.json(actions.slice(0, 300));
+  let results = actions;
+  if (userId) results = results.filter((a) => String(a.userId) === String(userId));
+  res.json(results.slice(0, 200));
 });
 
-// ---------------------------------------------------------------
-// ROBLOX LOOKUPS — proxied server-side so no Roblox/Open Cloud key
-// (and no extra CORS exposure) is ever sent to the browser.
-// ---------------------------------------------------------------
+// ============================================================
+// HEARTBEAT
+// ============================================================
+app.get("/api/heartbeat", requireModAuth, (req, res) => {
+  res.json(readJSON(HEARTBEAT_FILE, { lastViolationAt: null, lastPolledAt: null }));
+});
 
-async function robloxFetch(url, opts) {
-  const res = await fetch(url, opts);
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    const err = new Error(`Roblox API ${res.status}: ${body.slice(0, 200)}`);
-    err.status = res.status;
-    throw err;
+// ============================================================
+// ME / CONFIG
+// ============================================================
+app.get("/api/me", requireModAuth, (req, res) => {
+  res.json({
+    username: req.moderator.username,
+    role: req.moderator.role,
+    id: req.moderator.id,
+    config: {
+      gameName: GAME_NAME,
+      placeId: PLACE_ID,
+      universeId: UNIVERSE_ID,
+      gameDataConfigured: Boolean(OPEN_CLOUD_API_KEY && DATASTORE_NAME && UNIVERSE_ID),
+    },
+  });
+});
+
+// ============================================================
+// MODERATORS (admin only) — "add users" management
+// ============================================================
+app.get("/api/moderators", requireModAuth, requireAdmin, (req, res) => {
+  res.json(
+    moderators.map((m) => ({
+      id: m.id,
+      username: m.username,
+      role: m.role,
+      createdAt: m.createdAt,
+    }))
+  );
+});
+
+app.post("/api/moderators", requireModAuth, requireAdmin, (req, res) => {
+  const { username, role } = req.body || {};
+  if (!username || typeof username !== "string") {
+    return res.status(400).json({ error: "username is required." });
   }
-  return res.json();
+  const normalizedRole = role === "admin" ? "admin" : "moderator";
+  if (moderators.some((m) => m.username.toLowerCase() === username.toLowerCase())) {
+    return res.status(409).json({ error: "That username is already in use." });
+  }
+
+  const key = generateKey();
+  const entry = {
+    id: crypto.randomUUID(),
+    username,
+    keyHash: sha256(key),
+    role: normalizedRole,
+    createdAt: new Date().toISOString(),
+  };
+  moderators.push(entry);
+  saveModerators();
+
+  res.json({ id: entry.id, username: entry.username, role: entry.role, key });
+});
+
+app.delete("/api/moderators/:id", requireModAuth, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const target = moderators.find((m) => m.id === id);
+  if (!target) return res.status(404).json({ error: "Moderator not found." });
+
+  const admins = moderators.filter((m) => m.role === "admin");
+  if (target.role === "admin" && admins.length <= 1) {
+    return res.status(400).json({ error: "Can't delete the last remaining admin account." });
+  }
+
+  moderators = moderators.filter((m) => m.id !== id);
+  saveModerators();
+  res.json({ ok: true });
+});
+
+// ============================================================
+// ROBLOX LOOKUP
+// ============================================================
+function httpsJSON(options, body) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => {
+        try {
+          resolve({ status: res.statusCode, body: data ? JSON.parse(data) : null });
+        } catch (e) {
+          resolve({ status: res.statusCode, body: null });
+        }
+      });
+    });
+    req.on("error", reject);
+    if (body) req.write(JSON.stringify(body));
+    req.end();
+  });
 }
 
-// Dashboard -> here. Resolves a username or userId into a Roblox profile,
-// then merges in this panel's own moderation history for that player.
-app.get("/api/lookup/roblox", requireMod("moderator"), async (req, res) => {
-  const { username, userId } = req.query;
-  if (!username && !userId) {
-    return res.status(400).json({ error: "Provide a username or userId query param." });
-  }
-
+app.get("/api/lookup/roblox", requireModAuth, async (req, res) => {
   try {
-    let profile;
-    if (userId) {
-      profile = await robloxFetch(`https://users.roblox.com/v1/users/${encodeURIComponent(userId)}`);
-    } else {
-      const search = await robloxFetch("https://users.roblox.com/v1/usernames/users", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ usernames: [username], excludeBannedUsers: false }),
-      });
-      const match = search.data && search.data[0];
-      if (!match) return res.status(404).json({ error: "No Roblox user found with that username." });
-      profile = await robloxFetch(`https://users.roblox.com/v1/users/${match.id}`);
-    }
+    let { username, userId } = req.query;
 
-    let avatarUrl = null;
-    try {
-      const thumb = await robloxFetch(
-        `https://thumbnails.roblox.com/v1/users/avatar-headshot?userIds=${profile.id}&size=150x150&format=Png&isCircular=false`
+    if (!userId && username) {
+      const result = await httpsJSON(
+        {
+          hostname: "users.roblox.com",
+          path: "/v1/usernames/users",
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+        },
+        { usernames: [username], excludeBannedUsers: false }
       );
-      avatarUrl = thumb.data && thumb.data[0] && thumb.data[0].imageUrl;
-    } catch {
-      /* thumbnail is a nice-to-have, don't fail the lookup over it */
+      const match = result.body && result.body.data && result.body.data[0];
+      if (!match) return res.status(404).json({ error: "No Roblox user found with that username." });
+      userId = match.id;
     }
 
-    const violations = readJSON(VIOLATIONS_FILE).filter((v) => String(v.userId) === String(profile.id));
-    const actions = readJSON(ACTIONS_FILE).filter((a) => String(a.userId) === String(profile.id));
+    if (!userId) return res.status(400).json({ error: "Provide ?username= or ?userId=" });
+
+    const profile = await httpsJSON({
+      hostname: "users.roblox.com",
+      path: `/v1/users/${encodeURIComponent(userId)}`,
+      method: "GET",
+    });
+
+    if (profile.status !== 200 || !profile.body) {
+      return res.status(404).json({ error: "Roblox user not found." });
+    }
+
+    const thumb = await httpsJSON({
+      hostname: "thumbnails.roblox.com",
+      path: `/v1/users/avatar-headshot?userIds=${encodeURIComponent(userId)}&size=150x150&format=Png&isCircular=false`,
+      method: "GET",
+    });
+    const avatarUrl =
+      (thumb.body && thumb.body.data && thumb.body.data[0] && thumb.body.data[0].imageUrl) || null;
+
+    const history = violations.filter((v) => String(v.userId) === String(userId)).slice(0, 25);
+    const banHistory = actions.filter(
+      (a) => String(a.userId) === String(userId) && ["ban", "kick", "unban"].includes(a.type)
+    );
 
     res.json({
-      roblox: {
-        id: profile.id,
-        name: profile.name,
-        displayName: profile.displayName,
-        description: profile.description || "",
-        created: profile.created,
-        isBanned: !!profile.isBanned,
+      profile: {
+        id: profile.body.id,
+        name: profile.body.name,
+        displayName: profile.body.displayName,
+        description: profile.body.description,
+        created: profile.body.created,
+        isBanned: profile.body.isBanned,
         avatarUrl,
-        profileUrl: `https://www.roblox.com/users/${profile.id}/profile`,
       },
-      moderation: {
-        banStrikes: violations.filter((v) => v.severity === "ban").length,
-        warnings: violations.filter((v) => v.severity === "warning").length,
-        recentViolations: violations.slice(-25).reverse(),
-        recentActions: actions.slice(-25).reverse(),
+      panelHistory: {
+        violations: history,
+        actions: banHistory,
       },
     });
-  } catch (e) {
-    res.status(e.status === 404 ? 404 : 502).json({ error: e.message || "Lookup failed." });
+  } catch (err) {
+    console.error("[Sentinel] Lookup failed:", err.message);
+    res.status(502).json({ error: "Lookup failed — Roblox APIs may be unreachable." });
   }
 });
 
-// Dashboard -> here, optional. Only works if OPEN_CLOUD_API_KEY / UNIVERSE_ID /
-// DATASTORE_NAME are set — see README. Returns whatever your game stores in
-// that DataStore entry (currency, XP, private servers, etc.) as raw JSON;
-// the dashboard renders it generically since the schema is yours.
-app.get("/api/lookup/gamedata/:userId", requireMod("moderator"), async (req, res) => {
-  if (!(OPEN_CLOUD_API_KEY && UNIVERSE_ID && DATASTORE_NAME)) {
-    return res.status(501).json({
-      error:
-        "Open Cloud game-data lookup isn't configured. Set OPEN_CLOUD_API_KEY, UNIVERSE_ID and DATASTORE_NAME to enable it — see README.",
-    });
+app.get("/api/lookup/gamedata/:id", requireModAuth, async (req, res) => {
+  if (!OPEN_CLOUD_API_KEY || !DATASTORE_NAME || !UNIVERSE_ID) {
+    return res.status(404).json({ error: "Live game data isn't configured on this panel." });
   }
-  const entryKey = DATASTORE_KEY_TEMPLATE.replace("{userId}", req.params.userId);
-  const url =
-    `https://apis.roblox.com/datastores/v1/universes/${UNIVERSE_ID}/standard-datastores/datastore/entries/entry` +
-    `?datastoreName=${encodeURIComponent(DATASTORE_NAME)}&entryKey=${encodeURIComponent(entryKey)}`;
+
   try {
-    const data = await robloxFetch(url, { headers: { "x-api-key": OPEN_CLOUD_API_KEY } });
-    res.json({ entryKey, data });
-  } catch (e) {
-    res.status(e.status === 404 ? 404 : 502).json({
-      error: e.status === 404 ? `No DataStore entry found for key "${entryKey}".` : e.message,
+    const entryKey = DATASTORE_KEY_TEMPLATE.replace("{userId}", req.params.id);
+    const result = await httpsJSON({
+      hostname: "apis.roblox.com",
+      path: `/datastores/v1/universes/${UNIVERSE_ID}/standard-datastores/datastore/entries/entry?datastoreName=${encodeURIComponent(
+        DATASTORE_NAME
+      )}&entryKey=${encodeURIComponent(entryKey)}`,
+      method: "GET",
+      headers: { "x-api-key": OPEN_CLOUD_API_KEY },
     });
+
+    if (result.status !== 200) {
+      return res.status(404).json({ error: "No DataStore entry found for that player." });
+    }
+
+    res.json({ data: result.body });
+  } catch (err) {
+    console.error("[Sentinel] Game data lookup failed:", err.message);
+    res.status(502).json({ error: "Open Cloud request failed." });
   }
 });
 
-// ---------------------------------------------------------------
-// static dashboard
-// ---------------------------------------------------------------
-app.use(express.static(path.join(__dirname, "public")));
+// ============================================================
+// FALLBACK — serve the dashboard for any non-API GET
+// ============================================================
+app.get(/^(?!\/api\/).*/, (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "index.html"));
+});
 
 app.listen(PORT, () => {
-  console.log(`Moderation panel API listening on port ${PORT}`);
-  if (!GAME_API_KEY) {
-    console.warn("⚠️  GAME_API_KEY is not set — the /api/violations and /api/actions/* routes the game uses will reject every request until you set it.");
-  }
+  console.log(`[Sentinel] Listening on port ${PORT}`);
 });
