@@ -44,6 +44,25 @@ async function ensureModeratorsTable() {
       created_at TIMESTAMPTZ NOT NULL
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS datastore_configs (
+      id TEXT PRIMARY KEY,
+      label TEXT NOT NULL,
+      datastore_name TEXT NOT NULL,
+      key_template TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL
+    )
+  `);
+}
+
+function rowToDatastoreConfig(row) {
+  return {
+    id: row.id,
+    label: row.label,
+    datastoreName: row.datastore_name,
+    keyTemplate: row.key_template,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+  };
 }
 
 function rowToModerator(row) {
@@ -84,8 +103,6 @@ const PLACE_ID = process.env.PLACE_ID || "";
 const UNIVERSE_ID = process.env.UNIVERSE_ID || "";
 const GAME_NAME = process.env.GAME_NAME || "Roblox Game";
 const OPEN_CLOUD_API_KEY = process.env.OPEN_CLOUD_API_KEY || "";
-const DATASTORE_NAME = process.env.DATASTORE_NAME || "";
-const DATASTORE_KEY_TEMPLATE = process.env.DATASTORE_KEY_TEMPLATE || "{userId}";
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || "";
 
 if (!GAME_API_KEY) {
@@ -217,9 +234,47 @@ async function deleteModerator(id) {
   }
 }
 
+// ---- DataStore configs — lets staff wire up MULTIPLE named DataStores
+// (e.g. "Stats", "Currency", "Inventory") instead of just one. A player
+// lookup queries all of them in parallel and shows whatever comes back.
+const DATASTORE_CONFIGS_FILE = path.join(DATA_DIR, "datastore-configs.json"); // fallback only
+
+let datastoreConfigs = [];
+
+async function loadDatastoreConfigs() {
+  if (pool) {
+    const { rows } = await pool.query("SELECT * FROM datastore_configs ORDER BY created_at ASC");
+    datastoreConfigs = rows.map(rowToDatastoreConfig);
+  } else {
+    datastoreConfigs = readJSON(DATASTORE_CONFIGS_FILE, []);
+  }
+}
+
+async function insertDatastoreConfig(entry) {
+  datastoreConfigs.push(entry);
+  if (pool) {
+    await pool.query(
+      "INSERT INTO datastore_configs (id, label, datastore_name, key_template, created_at) VALUES ($1, $2, $3, $4, $5)",
+      [entry.id, entry.label, entry.datastoreName, entry.keyTemplate, entry.createdAt]
+    );
+  } else {
+    writeJSON(DATASTORE_CONFIGS_FILE, datastoreConfigs);
+  }
+}
+
+async function deleteDatastoreConfig(id) {
+  datastoreConfigs = datastoreConfigs.filter((d) => d.id !== id);
+  if (pool) {
+    await pool.query("DELETE FROM datastore_configs WHERE id = $1", [id]);
+  } else {
+    writeJSON(DATASTORE_CONFIGS_FILE, datastoreConfigs);
+  }
+}
+
 async function bootstrapAdminIfNeeded() {
   await ensureModeratorsTable();
   await loadModerators();
+  await loadDatastoreConfigs();
 
   if (moderators.length > 0) return;
 
@@ -429,9 +484,61 @@ app.get("/api/me", requireModAuth, (req, res) => {
       gameName: GAME_NAME,
       placeId: PLACE_ID,
       universeId: UNIVERSE_ID,
-      gameDataConfigured: Boolean(OPEN_CLOUD_API_KEY && DATASTORE_NAME && UNIVERSE_ID),
+      gameDataConfigured: Boolean(OPEN_CLOUD_API_KEY && UNIVERSE_ID && datastoreConfigs.length > 0),
     },
   });
+});
+
+// ============================================================
+// DATASTORE CONFIGS (admin only) — wire up multiple named DataStores
+// ============================================================
+app.get("/api/datastores", requireModAuth, requireAdmin, (req, res) => {
+  res.json(datastoreConfigs);
+});
+
+app.post("/api/datastores", requireModAuth, requireAdmin, async (req, res) => {
+  const { label, datastoreName, keyTemplate } = req.body || {};
+  if (!label || typeof label !== "string" || !label.trim()) {
+    return res.status(400).json({ error: "label is required." });
+  }
+  if (!datastoreName || typeof datastoreName !== "string" || !datastoreName.trim()) {
+    return res.status(400).json({ error: "datastoreName is required." });
+  }
+  const template = (typeof keyTemplate === "string" && keyTemplate.trim()) || "{userId}";
+  if (!template.includes("{userId}")) {
+    return res.status(400).json({ error: "keyTemplate must include {userId}." });
+  }
+
+  const entry = {
+    id: crypto.randomUUID(),
+    label: label.trim(),
+    datastoreName: datastoreName.trim(),
+    keyTemplate: template,
+    createdAt: new Date().toISOString(),
+  };
+
+  try {
+    await insertDatastoreConfig(entry);
+  } catch (err) {
+    console.error("[Sentinel] Failed to save DataStore config:", err.message);
+    return res.status(500).json({ error: "Failed to save DataStore config." });
+  }
+
+  res.json(entry);
+});
+
+app.delete("/api/datastores/:id", requireModAuth, requireAdmin, async (req, res) => {
+  const target = datastoreConfigs.find((d) => d.id === req.params.id);
+  if (!target) return res.status(404).json({ error: "DataStore config not found." });
+
+  try {
+    await deleteDatastoreConfig(req.params.id);
+  } catch (err) {
+    console.error("[Sentinel] Failed to delete DataStore config:", err.message);
+    return res.status(500).json({ error: "Failed to delete DataStore config." });
+  }
+
+  res.json({ ok: true });
 });
 
 // ============================================================
@@ -620,30 +727,45 @@ app.get("/api/lookup/roblox", requireModAuth, async (req, res) => {
 });
 
 app.get("/api/lookup/gamedata/:id", requireModAuth, async (req, res) => {
-  if (!OPEN_CLOUD_API_KEY || !DATASTORE_NAME || !UNIVERSE_ID) {
+  if (!OPEN_CLOUD_API_KEY || !UNIVERSE_ID || datastoreConfigs.length === 0) {
     return res.status(404).json({ error: "Live game data isn't configured on this panel." });
   }
 
-  try {
-    const entryKey = DATASTORE_KEY_TEMPLATE.replace("{userId}", req.params.id);
-    const result = await httpsJSON({
-      hostname: "apis.roblox.com",
-      path: `/datastores/v1/universes/${UNIVERSE_ID}/standard-datastores/datastore/entries/entry?datastoreName=${encodeURIComponent(
-        DATASTORE_NAME
-      )}&entryKey=${encodeURIComponent(entryKey)}`,
-      method: "GET",
-      headers: { "x-api-key": OPEN_CLOUD_API_KEY },
-    });
+  const results = await Promise.all(
+    datastoreConfigs.map(async (cfg) => {
+      try {
+        const entryKey = cfg.keyTemplate.replace("{userId}", req.params.id);
+        const result = await httpsJSON({
+          hostname: "apis.roblox.com",
+          path: `/datastores/v1/universes/${UNIVERSE_ID}/standard-datastores/datastore/entries/entry?datastoreName=${encodeURIComponent(
+            cfg.datastoreName
+          )}&entryKey=${encodeURIComponent(entryKey)}`,
+          method: "GET",
+          headers: { "x-api-key": OPEN_CLOUD_API_KEY },
+        });
 
-    if (result.status !== 200) {
-      return res.status(404).json({ error: "No DataStore entry found for that player." });
-    }
+        if (result.status !== 200) {
+          return { id: cfg.id, label: cfg.label, datastoreName: cfg.datastoreName, found: false };
+        }
+        return { id: cfg.id, label: cfg.label, datastoreName: cfg.datastoreName, found: true, data: result.body };
+      } catch (err) {
+        return {
+          id: cfg.id,
+          label: cfg.label,
+          datastoreName: cfg.datastoreName,
+          found: false,
+          error: "Request failed",
+        };
+      }
+    })
+  );
 
-    res.json({ data: result.body });
-  } catch (err) {
-    console.error("[Sentinel] Game data lookup failed:", err.message);
-    res.status(502).json({ error: "Open Cloud request failed." });
+  const anyFound = results.some((r) => r.found);
+  if (!anyFound) {
+    return res.status(404).json({ error: "No DataStore entries found for that player." });
   }
+
+  res.json({ datastores: results });
 });
 
 // ============================================================
