@@ -8,6 +8,7 @@ const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const https = require("https");
+const { Pool } = require("pg");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -15,10 +16,45 @@ const PORT = process.env.PORT || 3000;
 const DATA_DIR = path.join(__dirname, "data");
 const VIOLATIONS_FILE = path.join(DATA_DIR, "violations.json");
 const ACTIONS_FILE = path.join(DATA_DIR, "actions.json");
-const MODERATORS_FILE = path.join(DATA_DIR, "moderators.json");
+const MODERATORS_FILE = path.join(DATA_DIR, "moderators.json"); // fallback only, used if DATABASE_URL isn't set
 const HEARTBEAT_FILE = path.join(DATA_DIR, "heartbeat.json");
 
 if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+// ---- Postgres (Supabase/Neon) — persists moderator accounts across
+// redeploys, since Render's free disk is NOT guaranteed to survive one.
+// Everything else (violations/actions/heartbeat) still lives on local disk;
+// losing that history on a redeploy is a lot less painful than every
+// moderator's key resetting.
+const pool = process.env.DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+    })
+  : null;
+
+async function ensureModeratorsTable() {
+  if (!pool) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS moderators (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      key_hash TEXT NOT NULL,
+      role TEXT NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL
+    )
+  `);
+}
+
+function rowToModerator(row) {
+  return {
+    id: row.id,
+    username: row.username,
+    keyHash: row.key_hash,
+    role: row.role,
+    createdAt: row.created_at instanceof Date ? row.created_at.toISOString() : row.created_at,
+  };
+}
 
 function readJSON(file, fallback) {
   try {
@@ -132,35 +168,80 @@ function recordSuccess(ip) {
 // ============================================================
 // MODERATOR STORE
 // ============================================================
-let moderators = readJSON(MODERATORS_FILE, []);
+// In-memory cache of moderators — kept in sync with whichever backing store
+// is active (Postgres if DATABASE_URL is set, otherwise the local JSON
+// file), so the rest of the codebase (findModeratorByKey, etc.) can keep
+// reading it synchronously without every route becoming async-heavy.
+let moderators = [];
 
-function saveModerators() {
-  writeJSON(MODERATORS_FILE, moderators);
+async function loadModerators() {
+  if (pool) {
+    const { rows } = await pool.query("SELECT * FROM moderators ORDER BY created_at ASC");
+    moderators = rows.map(rowToModerator);
+  } else {
+    moderators = readJSON(MODERATORS_FILE, []);
+  }
 }
 
-function bootstrapAdminIfNeeded() {
+async function insertModerator(entry) {
+  moderators.push(entry);
+  if (pool) {
+    await pool.query(
+      "INSERT INTO moderators (id, username, key_hash, role, created_at) VALUES ($1, $2, $3, $4, $5)",
+      [entry.id, entry.username, entry.keyHash, entry.role, entry.createdAt]
+    );
+  } else {
+    writeJSON(MODERATORS_FILE, moderators);
+  }
+}
+
+async function updateModerator(entry) {
+  const idx = moderators.findIndex((m) => m.id === entry.id);
+  if (idx !== -1) moderators[idx] = entry;
+  if (pool) {
+    await pool.query(
+      "UPDATE moderators SET username = $2, key_hash = $3, role = $4 WHERE id = $1",
+      [entry.id, entry.username, entry.keyHash, entry.role]
+    );
+  } else {
+    writeJSON(MODERATORS_FILE, moderators);
+  }
+}
+
+async function deleteModerator(id) {
+  moderators = moderators.filter((m) => m.id !== id);
+  if (pool) {
+    await pool.query("DELETE FROM moderators WHERE id = $1", [id]);
+  } else {
+    writeJSON(MODERATORS_FILE, moderators);
+  }
+}
+
+async function bootstrapAdminIfNeeded() {
+  await ensureModeratorsTable();
+  await loadModerators();
+
   if (moderators.length > 0) return;
 
   const username = process.env.ADMIN_USERNAME || "admin";
   const key = process.env.ADMIN_KEY || generateKey();
 
-  moderators.push({
+  await insertModerator({
     id: crypto.randomUUID(),
     username,
     keyHash: sha256(key),
     role: "admin",
     createdAt: new Date().toISOString(),
   });
-  saveModerators();
 
   console.log("============================================================");
   console.log("[Sentinel] Bootstrap admin account created:");
   console.log(`  Username: ${username}`);
   console.log(`  Key:      ${key}`);
   console.log("  This key is shown ONCE — store it in a password manager.");
+  console.log(pool ? "  Stored in Postgres — safe across redeploys." : "  Stored in local JSON — WILL reset on a redeploy that wipes disk.");
   console.log("============================================================");
 }
-bootstrapAdminIfNeeded();
 
 function findModeratorByKey(key) {
   if (!key) return null;
@@ -367,7 +448,7 @@ app.get("/api/moderators", requireModAuth, requireAdmin, (req, res) => {
   );
 });
 
-app.post("/api/moderators", requireModAuth, requireAdmin, (req, res) => {
+app.post("/api/moderators", requireModAuth, requireAdmin, async (req, res) => {
   const { username, role } = req.body || {};
   if (!username || typeof username !== "string") {
     return res.status(400).json({ error: "username is required." });
@@ -385,13 +466,18 @@ app.post("/api/moderators", requireModAuth, requireAdmin, (req, res) => {
     role: normalizedRole,
     createdAt: new Date().toISOString(),
   };
-  moderators.push(entry);
-  saveModerators();
+
+  try {
+    await insertModerator(entry);
+  } catch (err) {
+    console.error("[Sentinel] Failed to save moderator:", err.message);
+    return res.status(500).json({ error: "Failed to save moderator." });
+  }
 
   res.json({ id: entry.id, username: entry.username, role: entry.role, key });
 });
 
-app.put("/api/moderators/:id", requireModAuth, requireAdmin, (req, res) => {
+app.put("/api/moderators/:id", requireModAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const target = moderators.find((m) => m.id === id);
   if (!target) return res.status(404).json({ error: "Moderator not found." });
@@ -416,11 +502,17 @@ app.put("/api/moderators/:id", requireModAuth, requireAdmin, (req, res) => {
     target.role = role;
   }
 
-  saveModerators();
+  try {
+    await updateModerator(target);
+  } catch (err) {
+    console.error("[Sentinel] Failed to update moderator:", err.message);
+    return res.status(500).json({ error: "Failed to update moderator." });
+  }
+
   res.json({ id: target.id, username: target.username, role: target.role, createdAt: target.createdAt });
 });
 
-app.delete("/api/moderators/:id", requireModAuth, requireAdmin, (req, res) => {
+app.delete("/api/moderators/:id", requireModAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const target = moderators.find((m) => m.id === id);
   if (!target) return res.status(404).json({ error: "Moderator not found." });
@@ -430,8 +522,13 @@ app.delete("/api/moderators/:id", requireModAuth, requireAdmin, (req, res) => {
     return res.status(400).json({ error: "Can't delete the last remaining admin account." });
   }
 
-  moderators = moderators.filter((m) => m.id !== id);
-  saveModerators();
+  try {
+    await deleteModerator(id);
+  } catch (err) {
+    console.error("[Sentinel] Failed to delete moderator:", err.message);
+    return res.status(500).json({ error: "Failed to delete moderator." });
+  }
+
   res.json({ ok: true });
 });
 
@@ -556,6 +653,13 @@ app.get(/^(?!\/api\/).*/, (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-app.listen(PORT, () => {
-  console.log(`[Sentinel] Listening on port ${PORT}`);
-});
+bootstrapAdminIfNeeded()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`[Sentinel] Listening on port ${PORT}`);
+    });
+  })
+  .catch((err) => {
+    console.error("[Sentinel] Failed to start:", err);
+    process.exit(1);
+  });
