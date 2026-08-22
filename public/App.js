@@ -342,10 +342,22 @@
           <td>${escapeHtml(m.username)}</td>
           <td class="${m.role === "admin" ? "role-admin" : ""}">${m.role}</td>
           <td>${new Date(m.createdAt).toLocaleDateString()}</td>
-          <td><button class="revoke-btn" data-id="${m.id}">Revoke</button></td>
+          <td class="row-actions">
+            <button class="revoke-btn" data-edit-id="${m.id}" data-edit-username="${escapeHtml(m.username)}" data-edit-role="${m.role}">Edit</button>
+            <button class="revoke-btn" data-id="${m.id}">Revoke</button>
+          </td>
         </tr>`
         )
         .join("");
+
+      $("#modTableBody").querySelectorAll("[data-edit-id]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          $("#editModId").value = btn.dataset.editId;
+          $("#editModUsername").value = btn.dataset.editUsername;
+          $("#editModRole").value = btn.dataset.editRole;
+          $("#editModModal").classList.remove("hidden");
+        });
+      });
 
       $("#modTableBody").querySelectorAll(".revoke-btn").forEach((btn) => {
         btn.addEventListener("click", async () => {
@@ -365,6 +377,25 @@
 
   $("#addModBtn").addEventListener("click", () => $("#addModModal").classList.remove("hidden"));
   $("#addModCancel").addEventListener("click", () => $("#addModModal").classList.add("hidden"));
+
+  $("#editModCancel").addEventListener("click", () => $("#editModModal").classList.add("hidden"));
+
+  $("#editModForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const id = $("#editModId").value;
+    const body = {
+      username: $("#editModUsername").value.trim(),
+      role: $("#editModRole").value,
+    };
+    try {
+      await api(`/api/moderators/${id}`, { method: "PUT", body: JSON.stringify(body) });
+      $("#editModModal").classList.add("hidden");
+      loadModerators();
+      toast("Moderator updated.");
+    } catch (err) {
+      toast(err.message);
+    }
+  });
 
   $("#addModForm").addEventListener("submit", async (e) => {
     e.preventDefault();
