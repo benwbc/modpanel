@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Sentinel — Moderation Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#0a0d10;
+    --panel:#12161b;
+    --panel-2:#171c22;
+    --line:#232a32;
+    --text:#e7ebee;
+    --muted:#8b96a3;
+    --ban:#ff4d5e;
+    --ban-dim:#3a1c22;
+    --warn:#ffb020;
+    --warn-dim:#3a2f14;
+    --ok:#33d17a;
+    --accent:#4fb6ff;
+    --mono:'IBM Plex Mono', monospace;
+    --sans:'Inter', sans-serif;
+  }
+  *{box-sizing:border-box;}
+  body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);}
+  ::selection{background:var(--accent);color:#00151f;}
+
+  /* ---------- gate ---------- */
+  #gate{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:50;}
+  #gate.hidden{display:none;}
+  .gate-card{width:360px;padding:32px;background:var(--panel);border:1px solid var(--line);border-radius:10px;}
+  .gate-card h1{font-family:var(--mono);font-size:15px;letter-spacing:.08em;text-transform:uppercase;color:var(--accent);margin:0 0 4px;}
+  .gate-card p{color:var(--muted);font-size:13px;margin:0 0 20px;line-height:1.5;}
+  .gate-card input{width:100%;padding:11px 12px;background:var(--panel-2);border:1px solid var(--line);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:13px;margin-bottom:12px;}
+  .gate-card button{width:100%;padding:11px;background:var(--accent);border:none;border-radius:6px;color:#00151f;font-weight:700;font-size:13px;cursor:pointer;letter-spacing:.02em;}
+  .gate-card button:hover{filter:brightness(1.08);}
+  .gate-err{color:var(--ban);font-size:12px;margin-top:8px;display:none;}
+
+  /* ---------- shell ---------- */
+  #app{display:none;max-width:1160px;margin:0 auto;padding:28px 20px 80px;}
+  #app.visible{display:block;}
+
+  header.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;}
+  .brand{display:flex;align-items:center;gap:10px;}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--ok);box-shadow:0 0 0 0 rgba(51,209,122,.6);animation:pulse 2s infinite;}
+  @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(51,209,122,.45);}70%{box-shadow:0 0 0 8px rgba(51,209,122,0);}100%{box-shadow:0 0 0 0 rgba(51,209,122,0);}}
+  .brand h1{font-family:var(--mono);font-size:16px;letter-spacing:.06em;margin:0;}
+  .brand span{color:var(--muted);font-family:var(--mono);font-size:11px;}
+  .top-right{display:flex;gap:10px;align-items:center;}
+  .refresh-note{font-family:var(--mono);font-size:11px;color:var(--muted);}
+  .logout{font-family:var(--mono);font-size:11px;color:var(--muted);background:none;border:1px solid var(--line);padding:6px 10px;border-radius:6px;cursor:pointer;}
+  .logout:hover{color:var(--text);border-color:var(--muted);}
+
+  .stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px;}
+  .stat{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px 18px;}
+  .stat .n{font-family:var(--mono);font-size:26px;font-weight:600;}
+  .stat .l{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:4px;}
+  .stat.ban .n{color:var(--ban);}
+  .stat.warn .n{color:var(--warn);}
+  .stat.ok .n{color:var(--ok);}
+
+  .toolbar{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;}
+  .toolbar input, .toolbar select{background:var(--panel);border:1px solid var(--line);color:var(--text);padding:9px 12px;border-radius:7px;font-family:var(--sans);font-size:13px;}
+  .toolbar input{flex:1;min-width:180px;}
+
+  .feed{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;}
+  .row{display:grid;grid-template-columns:70px 150px 1fr 160px 200px;gap:14px;align-items:center;padding:13px 16px;border-bottom:1px solid var(--line);font-size:13px;}
+  .row.head{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);background:var(--panel-2);}
+  .row:last-child{border-bottom:none;}
+  .badge{font-family:var(--mono);font-size:10px;padding:3px 7px;border-radius:4px;text-transform:uppercase;letter-spacing:.04em;display:inline-block;}
+  .badge.ban{background:var(--ban-dim);color:var(--ban);}
+  .badge.warning{background:var(--warn-dim);color:var(--warn);}
+  .player{font-weight:600;}
+  .player .id{display:block;color:var(--muted);font-family:var(--mono);font-size:10.5px;font-weight:400;}
+  .vtype{color:var(--text);}
+  .details{color:var(--muted);font-size:12px;display:block;margin-top:2px;}
+  .time{color:var(--muted);font-family:var(--mono);font-size:11.5px;}
+  .actions{display:flex;gap:6px;justify-content:flex-end;}
+  .actions button{font-family:var(--mono);font-size:10.5px;padding:6px 9px;border-radius:5px;border:1px solid var(--line);background:var(--panel-2);color:var(--text);cursor:pointer;}
+  .actions button:hover{border-color:var(--accent);color:var(--accent);}
+  .actions button.b-ban:hover{border-color:var(--ban);color:var(--ban);}
+  .empty{padding:40px;text-align:center;color:var(--muted);font-family:var(--mono);font-size:12.5px;}
+
+  footer{margin-top:20px;text-align:center;color:var(--muted);font-size:11px;font-family:var(--mono);}
+
+  @media(max-width:720px){
+    .stats{grid-template-columns:repeat(2,1fr);}
+    .row{grid-template-columns:1fr;gap:6px;}
+    .row.head{display:none;}
+    .actions{justify-content:flex-start;}
+  }
+</style>
+</head>
+<body>
+
+  <div id="gate">
+    <div class="gate-card">
+      <h1>Sentinel Access</h1>
+      <p>Enter the moderation panel API key configured on your server (the same value as the <code>API_KEY</code> environment variable).</p>
+      <input type="password" id="keyInput" placeholder="API key" autocomplete="off" />
+      <button onclick="tryConnect()">Connect</button>
+      <div class="gate-err" id="gateErr">Couldn't connect — check the key and that the API is running.</div>
+    </div>
+  </div>
+
+  <div id="app">
+    <header class="top">
+      <div class="brand">
+        <div class="dot"></div>
+        <div>
+          <h1>SENTINEL</h1>
+        </div>
+        <span>· anti-cheat moderation console</span>
+      </div>
+      <div class="top-right">
+        <span class="refresh-note" id="refreshNote">live</span>
+        <button class="logout" onclick="logout()">Disconnect</button>
+      </div>
+    </header>
+
+    <div class="stats">
+      <div class="stat"><div class="n" id="statTotal">–</div><div class="l">Total flags</div></div>
+      <div class="stat ban"><div class="n" id="statBans">–</div><div class="l">Auto-bans</div></div>
+      <div class="stat warn"><div class="n" id="statWarnings">–</div><div class="l">Warnings</div></div>
+      <div class="stat ok"><div class="n" id="statPlayers">–</div><div class="l">Flagged players</div></div>
+    </div>
+
+    <div class="toolbar">
+      <input type="text" id="search" placeholder="Search player, violation type, or details…" oninput="render()" />
+      <select id="severityFilter" onchange="render()">
+        <option value="">All severities</option>
+        <option value="ban">Auto-bans only</option>
+        <option value="warning">Warnings only</option>
+      </select>
+    </div>
+
+    <div class="feed" id="feed"></div>
+
+    <footer>Polling every 6s · Actions queue for the game server to execute within ~10s</footer>
+  </div>
+
+<script>
+  let API_KEY = localStorage.getItem('sentinel_key') || '';
+  let violations = [];
+  let pollTimer = null;
+
+  async function api(path, opts = {}) {
+    const res = await fetch(path, {
+      ...opts,
+      headers: {
+        'Content-Type': 'application/json',
+        'X-API-Key': API_KEY,
+        ...(opts.headers || {}),
+      },
+    });
+    if (!res.ok) throw new Error('Request failed: ' + res.status);
+    return res.json();
+  }
+
+  async function tryConnect() {
+    const input = document.getElementById('keyInput').value.trim();
+    if (!input) return;
+    API_KEY = input;
+    try {
+      await api('/api/violations?limit=1');
+      localStorage.setItem('sentinel_key', API_KEY);
+      document.getElementById('gate').classList.add('hidden');
+      document.getElementById('app').classList.add('visible');
+      startPolling();
+    } catch (e) {
+      document.getElementById('gateErr').style.display = 'block';
+    }
+  }
+
+  function logout() {
+    localStorage.removeItem('sentinel_key');
+    API_KEY = '';
+    clearInterval(pollTimer);
+    document.getElementById('gate').classList.remove('hidden');
+    document.getElementById('app').classList.remove('visible');
+  }
+
+  function timeAgo(unixSeconds) {
+    const s = Math.floor(Date.now() / 1000) - unixSeconds;
+    if (s < 60) return s + 's ago';
+    if (s < 3600) return Math.floor(s / 60) + 'm ago';
+    if (s < 86400) return Math.floor(s / 3600) + 'h ago';
+    return Math.floor(s / 86400) + 'd ago';
+  }
+
+  async function refresh() {
+    try {
+      violations = await api('/api/violations?limit=300');
+      document.getElementById('refreshNote').textContent = 'live · updated ' + new Date().toLocaleTimeString();
+      render();
+    } catch (e) {
+      document.getElementById('refreshNote').textContent = 'connection lost, retrying…';
+    }
+  }
+
+  function render() {
+    const search = document.getElementById('search').value.toLowerCase();
+    const sev = document.getElementById('severityFilter').value;
+
+    let list = violations.filter(v => {
+      if (sev && v.severity !== sev) return false;
+      if (search && !(v.username.toLowerCase().includes(search) || v.violationType.toLowerCase().includes(search) || (v.details||'').toLowerCase().includes(search))) return false;
+      return true;
+    });
+
+    document.getElementById('statTotal').textContent = violations.length;
+    document.getElementById('statBans').textContent = violations.filter(v => v.severity === 'ban').length;
+    document.getElementById('statWarnings').textContent = violations.filter(v => v.severity === 'warning').length;
+    document.getElementById('statPlayers').textContent = new Set(violations.map(v => v.userId)).size;
+
+    const feed = document.getElementById('feed');
+    if (list.length === 0) {
+      feed.innerHTML = '<div class="empty">No violations match. Either your server is quiet, or nobody has tripped a check yet.</div>';
+      return;
+    }
+
+    feed.innerHTML = '<div class="row head"><div>Sev</div><div>Player</div><div>Violation</div><div>When</div><div style="text-align:right">Actions</div></div>' +
+      list.map(v => `
+        <div class="row">
+          <div><span class="badge ${v.severity}">${v.severity === 'ban' ? 'BAN' : 'WARN'}</span></div>
+          <div class="player">${escapeHtml(v.username)}<span class="id">${v.userId}</span></div>
+          <div class="vtype">${escapeHtml(v.violationType)}<span class="details">${escapeHtml(v.details || '')}</span></div>
+          <div class="time">${timeAgo(v.timestamp)}</div>
+          <div class="actions">
+            <button class="b-kick" onclick="queueAction('kick', ${v.userId}, '${escapeAttr(v.username)}')">Kick</button>
+            <button class="b-ban" onclick="queueAction('ban', ${v.userId}, '${escapeAttr(v.username)}')">Ban</button>
+          </div>
+        </div>
+      `).join('');
+  }
+
+  async function queueAction(type, userId, username) {
+    const reason = prompt(`Reason for ${type}ning ${username} (UserId ${userId})?`, 'Exploit detected by anti-cheat');
+    if (reason === null) return;
+    try {
+      await api('/api/actions', { method: 'POST', body: JSON.stringify({ type, userId, username, reason }) });
+      alert(`Queued: ${type} for ${username}. The game server picks this up within ~10s.`);
+    } catch (e) {
+      alert('Failed to queue action — check the console/API.');
+    }
+  }
+
+  function escapeHtml(s) { return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+  function escapeAttr(s) { return (s || '').replace(/'/g, "\\'"); }
+
+  function startPolling() {
+    refresh();
+    pollTimer = setInterval(refresh, 6000);
+  }
+
+  document.getElementById('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') tryConnect(); });
+
+  if (API_KEY) {
+    document.getElementById('gate').classList.add('hidden');
+    document.getElementById('app').classList.add('visible');
+    startPolling();
+  }
+</script>
+</body>
+</html>
