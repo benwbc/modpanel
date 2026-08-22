@@ -27,7 +27,30 @@ const crypto = require("crypto");
 const app = express();
 app.disable("x-powered-by");
 app.set("trust proxy", 1); // Render sits behind a proxy; needed for correct req.ip
-app.use(helmet({ contentSecurityPolicy: false })); // CSP off: single inline-script dashboard, no user-generated HTML is ever injected unescaped
+app.use(
+  helmet({
+    // A real CSP instead of none: this dashboard is a single static file with
+    // one inline <script>/<style> block (no build step), so script-src/style-src
+    // need 'unsafe-inline' — but everything else is locked to 'self', which still
+    // blocks any third-party script/iframe/object from ever running here.
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "'unsafe-inline'"],
+        styleSrc: ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com"],
+        fontSrc: ["'self'", "https://fonts.gstatic.com"],
+        imgSrc: ["'self'", "data:", "https://*.rbxcdn.com", "https://thumbnails.roblox.com"],
+        connectSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"],
+      },
+    },
+    frameguard: { action: "deny" },
+    referrerPolicy: { policy: "no-referrer" },
+  })
+);
 app.use(express.json({ limit: "1mb" }));
 
 // No CORS headers are set anywhere below, so browsers block cross-origin
@@ -209,12 +232,29 @@ app.use(
 
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
+// Tighter limiter specifically for key-checking endpoints (login, adding a
+// moderator). These are the routes a brute-force attempt actually targets,
+// so on top of the per-IP lockout above, cap how fast they can even be tried.
+const authLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many requests. Slow down and try again shortly." },
+});
+
+// Small helper: reject fields that are the wrong type or absurdly long,
+// instead of silently truncating/coercing them into the JSON store.
+function badLength(value, max) {
+  return typeof value === "string" && value.length > max;
+}
+
 // ---------------------------------------------------------------
 // AUTH / MODERATORS
 // ---------------------------------------------------------------
 
 // Dashboard -> here, right after login, to confirm the key and get identity + config.
-app.get("/api/me", requireMod("moderator"), (req, res) => {
+app.get("/api/me", authLimiter, requireMod("moderator"), (req, res) => {
   res.json({
     moderator: req.moderator,
     settings: {
@@ -237,10 +277,16 @@ app.get("/api/moderators", requireMod("admin"), (req, res) => {
   res.json(mods);
 });
 
-app.post("/api/moderators", requireMod("admin"), (req, res) => {
+app.post("/api/moderators", authLimiter, requireMod("admin"), (req, res) => {
   const { username, role } = req.body || {};
   if (!username || typeof username !== "string" || !username.trim()) {
     return res.status(400).json({ error: "username is required." });
+  }
+  if (badLength(username, 40)) {
+    return res.status(400).json({ error: "username is too long (40 characters max)." });
+  }
+  if (!/^[a-zA-Z0-9_. #-]+$/.test(username.trim())) {
+    return res.status(400).json({ error: "username may only contain letters, numbers, spaces, and _ . - #" });
   }
   const safeRole = role === "admin" ? "admin" : "moderator";
   const mods = readJSON(MODERATORS_FILE);
@@ -290,6 +336,9 @@ app.post("/api/violations", requireGameKey, (req, res) => {
 
   if (!userId || !violationType) {
     return res.status(400).json({ error: "userId and violationType are required." });
+  }
+  if (badLength(username, 60) || badLength(violationType, 120) || badLength(details, 2000)) {
+    return res.status(400).json({ error: "One of the fields is too long." });
   }
 
   const violations = readJSON(VIOLATIONS_FILE);
@@ -343,6 +392,12 @@ app.post("/api/actions", requireMod("moderator"), (req, res) => {
   const { type, userId, username, reason, notes, banLength } = req.body || {};
   if (!["ban", "kick", "unban"].includes(type) || !userId) {
     return res.status(400).json({ error: "type must be ban/kick/unban, and userId is required." });
+  }
+  if (!/^[0-9]+$/.test(String(userId))) {
+    return res.status(400).json({ error: "userId must be a numeric Roblox ID — resolve the username first." });
+  }
+  if (badLength(username, 60) || badLength(reason, 300) || badLength(notes, 2000) || badLength(banLength, 40)) {
+    return res.status(400).json({ error: "One of the fields is too long." });
   }
 
   const actions = readJSON(ACTIONS_FILE);
