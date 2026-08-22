@@ -391,6 +391,35 @@ app.post("/api/moderators", requireModAuth, requireAdmin, (req, res) => {
   res.json({ id: entry.id, username: entry.username, role: entry.role, key });
 });
 
+app.put("/api/moderators/:id", requireModAuth, requireAdmin, (req, res) => {
+  const { id } = req.params;
+  const target = moderators.find((m) => m.id === id);
+  if (!target) return res.status(404).json({ error: "Moderator not found." });
+
+  const { username, role } = req.body || {};
+
+  if (username && typeof username === "string" && username.trim()) {
+    const trimmed = username.trim();
+    const clash = moderators.some(
+      (m) => m.id !== id && m.username.toLowerCase() === trimmed.toLowerCase()
+    );
+    if (clash) return res.status(409).json({ error: "That username is already in use." });
+    target.username = trimmed;
+  }
+
+  if (role && ["admin", "moderator"].includes(role)) {
+    const wasAdmin = target.role === "admin";
+    const admins = moderators.filter((m) => m.role === "admin");
+    if (wasAdmin && role !== "admin" && admins.length <= 1) {
+      return res.status(400).json({ error: "Can't demote the last remaining admin." });
+    }
+    target.role = role;
+  }
+
+  saveModerators();
+  res.json({ id: target.id, username: target.username, role: target.role, createdAt: target.createdAt });
+});
+
 app.delete("/api/moderators/:id", requireModAuth, requireAdmin, (req, res) => {
   const { id } = req.params;
   const target = moderators.find((m) => m.id === id);
