@@ -77,8 +77,10 @@
 
     if (state.me.role !== "admin") {
       $("#adminOnlyPanel").classList.add("hidden");
+      $("#datastoreOnlyPanel").classList.add("hidden");
     } else {
       $("#adminOnlyPanel").classList.remove("hidden");
+      $("#datastoreOnlyPanel").classList.remove("hidden");
     }
 
     $("#cfgGameName").textContent = state.config.gameName || "—";
@@ -115,7 +117,10 @@
       $(`#view-${btn.dataset.view}`).classList.remove("hidden");
 
       if (btn.dataset.view === "actions") loadActions();
-      if (btn.dataset.view === "settings" && state.me.role === "admin") loadModerators();
+      if (btn.dataset.view === "settings" && state.me.role === "admin") {
+        loadModerators();
+        loadDatastores();
+      }
     });
   });
 
@@ -223,6 +228,55 @@
   // ------------------------------------------------------------
   // LOOKUP
   // ------------------------------------------------------------
+  // Flattens nested objects/arrays into "a.b.c" -> value rows for a clean
+  // stats table, regardless of how a given game happens to shape its data.
+  function flattenForDisplay(value, prefix, rows) {
+    rows = rows || [];
+    if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+      const keys = Object.keys(value);
+      if (keys.length === 0) {
+        rows.push([prefix || "(empty)", "{}"]);
+      } else {
+        keys.forEach((k) => flattenForDisplay(value[k], prefix ? `${prefix}.${k}` : k, rows));
+      }
+    } else if (Array.isArray(value)) {
+      if (value.length === 0) {
+        rows.push([prefix || "(empty)", "[]"]);
+      } else if (value.every((v) => v === null || typeof v !== "object")) {
+        rows.push([prefix, JSON.stringify(value)]);
+      } else {
+        value.forEach((v, i) => flattenForDisplay(v, `${prefix}[${i}]`, rows));
+      }
+    } else {
+      rows.push([prefix, String(value)]);
+    }
+    return rows;
+  }
+
+  function renderDatastoreResults(datastores) {
+    return datastores
+      .map((ds) => {
+        if (!ds.found) {
+          return `
+            <div class="datastore-card">
+              <h3>${escapeHtml(ds.label)} <span class="sub" style="margin:0">(${escapeHtml(ds.datastoreName)})</span></h3>
+              <p class="sub" style="margin:4px 0 0">${ds.error ? "Lookup failed." : "No entry for this player."}</p>
+            </div>`;
+        }
+        const rows = flattenForDisplay(ds.data, "", []);
+        return `
+          <div class="datastore-card">
+            <h3>${escapeHtml(ds.label)} <span class="sub" style="margin:0">(${escapeHtml(ds.datastoreName)})</span></h3>
+            <table class="stats-table">
+              <tbody>
+                ${rows.map(([k, v]) => `<tr><td>${escapeHtml(k)}</td><td>${escapeHtml(v)}</td></tr>`).join("")}
+              </tbody>
+            </table>
+          </div>`;
+      })
+      .join("");
+  }
+
   async function doLookup(query) {
     const isNumeric = /^\d+$/.test(query);
     const params = isNumeric ? `userId=${encodeURIComponent(query)}` : `username=${encodeURIComponent(query)}`;
@@ -238,9 +292,9 @@
       if (state.config.gameDataConfigured) {
         try {
           const gd = await api(`/api/lookup/gamedata/${p.id}`);
-          gameDataHtml = `<h2>Live game data</h2><pre>${escapeHtml(JSON.stringify(gd.data, null, 2))}</pre>`;
+          gameDataHtml = `<h2 style="margin-top:18px">Stats</h2>${renderDatastoreResults(gd.datastores)}`;
         } catch (e) {
-          // no entry — skip silently, as documented
+          // no entries anywhere — skip silently, as documented
         }
       }
 
@@ -417,6 +471,64 @@
   });
 
   $("#newKeyClose").addEventListener("click", () => $("#newKeyModal").classList.add("hidden"));
+
+  // ------------------------------------------------------------
+  // DATASTORES (multiple named DataStores, checked on every lookup)
+  // ------------------------------------------------------------
+  async function loadDatastores() {
+    try {
+      const list = await api("/api/datastores");
+      $("#datastoreTableBody").innerHTML = list
+        .map(
+          (d) => `
+        <tr>
+          <td>${escapeHtml(d.label)}</td>
+          <td><code>${escapeHtml(d.datastoreName)}</code></td>
+          <td><code>${escapeHtml(d.keyTemplate)}</code></td>
+          <td class="row-actions">
+            <button class="revoke-btn" data-id="${d.id}">Remove</button>
+          </td>
+        </tr>`
+        )
+        .join("");
+
+      $("#datastoreTableBody").querySelectorAll(".revoke-btn").forEach((btn) => {
+        btn.addEventListener("click", async () => {
+          if (!confirm("Remove this DataStore from lookups?")) return;
+          try {
+            await api(`/api/datastores/${btn.dataset.id}`, { method: "DELETE" });
+            loadDatastores();
+          } catch (err) {
+            toast(err.message);
+          }
+        });
+      });
+    } catch (err) {
+      toast(err.message);
+    }
+  }
+
+  $("#addDatastoreBtn").addEventListener("click", () => $("#addDatastoreModal").classList.remove("hidden"));
+  $("#addDatastoreCancel").addEventListener("click", () => $("#addDatastoreModal").classList.add("hidden"));
+
+  $("#addDatastoreForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const label = $("#newDatastoreLabel").value.trim();
+    const datastoreName = $("#newDatastoreName").value.trim();
+    const keyTemplate = $("#newDatastoreKeyTemplate").value.trim();
+    try {
+      await api("/api/datastores", {
+        method: "POST",
+        body: JSON.stringify({ label, datastoreName, keyTemplate: keyTemplate || undefined }),
+      });
+      $("#addDatastoreModal").classList.add("hidden");
+      $("#addDatastoreForm").reset();
+      loadDatastores();
+      toast("DataStore added.");
+    } catch (err) {
+      toast(err.message);
+    }
+  });
 
   // ------------------------------------------------------------
   // INIT
