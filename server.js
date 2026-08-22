@@ -275,6 +275,7 @@ async function bootstrapAdminIfNeeded() {
   await ensureModeratorsTable();
   await loadModerators();
   await loadDatastoreConfigs();
+  await seedKnownDatastoreConfigs();
 
   if (moderators.length > 0) return;
 
@@ -296,6 +297,55 @@ async function bootstrapAdminIfNeeded() {
   console.log("  This key is shown ONCE — store it in a password manager.");
   console.log(pool ? "  Stored in Postgres — safe across redeploys." : "  Stored in local JSON — WILL reset on a redeploy that wipes disk.");
   console.log("============================================================");
+}
+
+// ---- Known real DataStores, confirmed directly from the game's own scripts
+// (ServerScriptService / ReplicatedStorage.framework), so staff don't have to
+// hand-type them into Settings. Runs every boot but is idempotent — only
+// inserts ones that aren't already configured by that exact DataStore name,
+// and cleans up the one known placeholder value from earlier manual setup.
+const KNOWN_DATASTORES = [
+  { label: "Bank & Wallet", datastoreName: "PlayerEconomyData", keyTemplate: "{userId}" },
+  { label: "Owned Houses", datastoreName: "PlayerHousesData_v1", keyTemplate: "{userId}" },
+  { label: "Radio Callsign", datastoreName: "PlayerCallsigns", keyTemplate: "{userId}" },
+  { label: "Purchased Shop Items", datastoreName: "ShopOwnedItemsV1", keyTemplate: "{userId}" },
+];
+const KNOWN_PLACEHOLDER_NAMES = ["changeThisBankKey.v1"];
+
+async function seedKnownDatastoreConfigs() {
+  for (const placeholder of KNOWN_PLACEHOLDER_NAMES) {
+    const bad = datastoreConfigs.find((d) => d.datastoreName === placeholder);
+    if (bad) {
+      console.log(`[Sentinel] Removing placeholder DataStore config: ${placeholder}`);
+      await deleteDatastoreConfig(bad.id);
+    }
+  }
+
+  for (const known of KNOWN_DATASTORES) {
+    const existing = datastoreConfigs.find((d) => d.datastoreName === known.datastoreName);
+    if (!existing) {
+      console.log(`[Sentinel] Seeding DataStore config: ${known.label} (${known.datastoreName})`);
+      await insertDatastoreConfig({
+        id: crypto.randomUUID(),
+        label: known.label,
+        datastoreName: known.datastoreName,
+        keyTemplate: known.keyTemplate,
+        createdAt: new Date().toISOString(),
+      });
+    } else if (existing.label !== known.label || existing.keyTemplate !== known.keyTemplate) {
+      console.log(`[Sentinel] Updating DataStore config label: ${existing.label} -> ${known.label}`);
+      existing.label = known.label;
+      existing.keyTemplate = known.keyTemplate;
+      if (pool) {
+        await pool.query(
+          "UPDATE datastore_configs SET label = $2, key_template = $3 WHERE id = $1",
+          [existing.id, known.label, known.keyTemplate]
+        );
+      } else {
+        writeJSON(DATASTORE_CONFIGS_FILE, datastoreConfigs);
+      }
+    }
+  }
 }
 
 function findModeratorByKey(key) {
@@ -744,10 +794,29 @@ app.get("/api/lookup/gamedata/:id", requireModAuth, async (req, res) => {
           headers: { "x-api-key": OPEN_CLOUD_API_KEY },
         });
 
-        if (result.status !== 200) {
+        if (result.status === 200) {
+          return { id: cfg.id, label: cfg.label, datastoreName: cfg.datastoreName, found: true, data: result.body };
+        }
+        if (result.status === 404) {
           return { id: cfg.id, label: cfg.label, datastoreName: cfg.datastoreName, found: false };
         }
-        return { id: cfg.id, label: cfg.label, datastoreName: cfg.datastoreName, found: true, data: result.body };
+        // Anything else (401/403 = bad/under-scoped key, 429 = rate limited, 5xx, etc.)
+        // is a REAL problem, not "this player just has no data" — surface it as such
+        // instead of quietly looking identical to an empty entry.
+        const reason =
+          result.status === 401 || result.status === 403
+            ? "API key missing/invalid, or not scoped to this DataStore."
+            : result.status === 429
+            ? "Rate limited by Roblox Open Cloud — try again shortly."
+            : `Unexpected response (HTTP ${result.status}).`;
+        return {
+          id: cfg.id,
+          label: cfg.label,
+          datastoreName: cfg.datastoreName,
+          found: false,
+          error: reason,
+          httpStatus: result.status,
+        };
       } catch (err) {
         return {
           id: cfg.id,
