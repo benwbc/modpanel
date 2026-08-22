@@ -294,7 +294,7 @@
           const gd = await api(`/api/lookup/gamedata/${p.id}`);
           gameDataHtml = `<h2 style="margin-top:18px">Stats</h2>${renderDatastoreResults(gd.datastores)}`;
         } catch (e) {
-          // no entries anywhere — skip silently, as documented
+          gameDataHtml = `<h2 style="margin-top:18px">Stats</h2><p class="sub" style="margin:0">Couldn't reach DataStore lookup (${escapeHtml(e.message)}).</p>`;
         }
       }
 
