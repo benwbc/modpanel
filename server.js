@@ -761,11 +761,7 @@ app.get("/api/lookup/gamedata/:id", requireModAuth, async (req, res) => {
   );
 
   const anyFound = results.some((r) => r.found);
-  if (!anyFound) {
-    return res.status(404).json({ error: "No DataStore entries found for that player." });
-  }
-
-  res.json({ datastores: results });
+  res.json({ datastores: results, anyFound });
 });
 
 // ============================================================
