@@ -789,6 +789,9 @@ function httpsJSON(options, body) {
         }
       });
     });
+    req.setTimeout(10000, () => {
+      req.destroy(new Error("Request timed out after 10s"));
+    });
     req.on("error", reject);
     if (body) req.write(JSON.stringify(body));
     req.end();
@@ -902,12 +905,13 @@ app.get("/api/lookup/gamedata/:id", requireModAuth, async (req, res) => {
           httpStatus: result.status,
         };
       } catch (err) {
+        console.error(`[Sentinel] DataStore request failed for ${cfg.datastoreName}:`, err.message);
         return {
           id: cfg.id,
           label: cfg.label,
           datastoreName: cfg.datastoreName,
           found: false,
-          error: "Request failed",
+          error: `Request failed: ${err.message}`,
         };
       }
     })
@@ -961,7 +965,7 @@ app.get("/api/lookup/privateservers/:id", requireModAuth, async (req, res) => {
     res.json({ servers: owned });
   } catch (err) {
     console.error("[Sentinel] Private server lookup failed:", err.message);
-    res.status(502).json({ error: "Request failed." });
+    res.status(502).json({ error: `Request failed: ${err.message}` });
   }
 });
 
