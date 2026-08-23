@@ -53,6 +53,37 @@ async function ensureModeratorsTable() {
       created_at TIMESTAMPTZ NOT NULL
     )
   `);
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS actions (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      user_id BIGINT NOT NULL,
+      username TEXT,
+      reason TEXT,
+      notes TEXT,
+      ban_length TEXT,
+      queued_by TEXT NOT NULL,
+      queued_at TIMESTAMPTZ NOT NULL,
+      acknowledged BOOLEAN NOT NULL DEFAULT FALSE,
+      acknowledged_at TIMESTAMPTZ
+    )
+  `);
+}
+
+function rowToAction(row) {
+  return {
+    id: row.id,
+    type: row.type,
+    userId: Number(row.user_id),
+    username: row.username || "",
+    reason: row.reason || "",
+    notes: row.notes || "",
+    banLength: row.ban_length,
+    queuedBy: row.queued_by,
+    queuedAt: row.queued_at instanceof Date ? row.queued_at.toISOString() : row.queued_at,
+    acknowledged: row.acknowledged,
+    acknowledgedAt: row.acknowledged_at instanceof Date ? row.acknowledged_at.toISOString() : row.acknowledged_at,
+  };
 }
 
 function rowToDatastoreConfig(row) {
@@ -271,10 +302,60 @@ async function deleteDatastoreConfig(id) {
   }
 }
 
+// ---- Actions (ban/kick/unban queue + audit history) — the actual
+// enforcement lives in the game's own AdminBanList DataStore regardless of
+// this, but the panel's queue/history used to live only on Render's local
+// disk and got wiped on every redeploy along with moderators. Same fix,
+// same pattern: Postgres when available, JSON fallback otherwise.
+let actions = [];
+const MAX_ACTIONS_STORED = 5000;
+
+async function loadActions() {
+  if (pool) {
+    const { rows } = await pool.query(
+      "SELECT * FROM actions ORDER BY queued_at DESC LIMIT $1",
+      [MAX_ACTIONS_STORED]
+    );
+    actions = rows.map(rowToAction);
+  } else {
+    actions = readJSON(ACTIONS_FILE, []);
+  }
+}
+
+async function insertAction(entry) {
+  actions.unshift(entry);
+  if (actions.length > MAX_ACTIONS_STORED) actions.length = MAX_ACTIONS_STORED;
+  if (pool) {
+    await pool.query(
+      `INSERT INTO actions (id, type, user_id, username, reason, notes, ban_length, queued_by, queued_at, acknowledged)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false)`,
+      [entry.id, entry.type, entry.userId, entry.username, entry.reason, entry.notes, entry.banLength, entry.queuedBy, entry.queuedAt]
+    );
+  } else {
+    writeJSON(ACTIONS_FILE, actions);
+  }
+}
+
+async function ackAction(actionId) {
+  const entry = actions.find((a) => a.id === actionId);
+  if (!entry) return;
+  entry.acknowledged = true;
+  entry.acknowledgedAt = new Date().toISOString();
+  if (pool) {
+    await pool.query(
+      "UPDATE actions SET acknowledged = true, acknowledged_at = $2 WHERE id = $1",
+      [actionId, entry.acknowledgedAt]
+    );
+  } else {
+    writeJSON(ACTIONS_FILE, actions);
+  }
+}
+
 async function bootstrapAdminIfNeeded() {
   await ensureModeratorsTable();
   await loadModerators();
   await loadDatastoreConfigs();
+  await loadActions();
   await seedKnownDatastoreConfigs();
 
   if (moderators.length > 0) return;
@@ -309,6 +390,8 @@ const KNOWN_DATASTORES = [
   { label: "Owned Houses", datastoreName: "PlayerHousesData_v1", keyTemplate: "{userId}" },
   { label: "Radio Callsign", datastoreName: "PlayerCallsigns", keyTemplate: "{userId}" },
   { label: "Purchased Shop Items", datastoreName: "ShopOwnedItemsV1", keyTemplate: "{userId}" },
+  { label: "XP by Team", datastoreName: "changeThisRankXPKey.v01", keyTemplate: "{userId}" },
+  { label: "Robux Purchases", datastoreName: "PlayerPurchaseLog", keyTemplate: "{userId}" },
 ];
 const KNOWN_PLACEHOLDER_NAMES = ["changeThisBankKey.v1"];
 
@@ -456,23 +539,22 @@ app.get("/api/violations", requireModAuth, (req, res) => {
 // ============================================================
 // ACTIONS (ban / kick / unban queue)
 // ============================================================
-let actions = readJSON(ACTIONS_FILE, []);
-const MAX_ACTIONS_STORED = 5000;
-
-function saveActions() {
-  writeJSON(ACTIONS_FILE, actions);
-}
-
-app.post("/api/actions", requireModAuth, (req, res) => {
-  const { type, userId, reason, notes, banLength } = req.body || {};
+app.post("/api/actions", requireModAuth, async (req, res) => {
+  const { type, userId, username, reason, notes, banLength } = req.body || {};
   if (!["ban", "kick", "unban"].includes(type) || !userId) {
     return res.status(400).json({ error: "type (ban|kick|unban) and userId are required." });
+  }
+
+  const numericUserId = Number(userId);
+  if (!Number.isInteger(numericUserId) || numericUserId <= 0) {
+    return res.status(400).json({ error: "userId must be a valid numeric Roblox UserId." });
   }
 
   const entry = {
     id: crypto.randomUUID(),
     type,
-    userId,
+    userId: numericUserId,
+    username: (typeof username === "string" && username.trim()) || "",
     reason: reason || "",
     notes: notes || "",
     banLength: banLength || null,
@@ -481,9 +563,12 @@ app.post("/api/actions", requireModAuth, (req, res) => {
     acknowledged: false,
   };
 
-  actions.unshift(entry);
-  if (actions.length > MAX_ACTIONS_STORED) actions.length = MAX_ACTIONS_STORED;
-  saveActions();
+  try {
+    await insertAction(entry);
+  } catch (err) {
+    console.error("[Sentinel] Failed to save action:", err.message);
+    return res.status(500).json({ error: "Failed to queue action." });
+  }
 
   res.json({ ok: true, id: entry.id });
 });
@@ -497,13 +582,12 @@ app.get("/api/actions/pending", requireGameAuth, (req, res) => {
   res.json(pending);
 });
 
-app.post("/api/actions/ack", requireGameAuth, (req, res) => {
+app.post("/api/actions/ack", requireGameAuth, async (req, res) => {
   const { actionId } = req.body || {};
-  const entry = actions.find((a) => a.id === actionId);
-  if (entry) {
-    entry.acknowledged = true;
-    entry.acknowledgedAt = new Date().toISOString();
-    saveActions();
+  try {
+    await ackAction(actionId);
+  } catch (err) {
+    console.error("[Sentinel] Failed to ack action:", err.message);
   }
   res.json({ ok: true });
 });
@@ -831,6 +915,54 @@ app.get("/api/lookup/gamedata/:id", requireModAuth, async (req, res) => {
 
   const anyFound = results.some((r) => r.found);
   res.json({ datastores: results, anyFound });
+});
+
+// Private servers are stored completely differently from everything else:
+// ONE global key ("AllServers" in the "PrivateServersV1" DataStore) holding
+// a JSON array of every private server that's ever been created, each with
+// an ownerId. So instead of a per-user entry lookup, this fetches that one
+// key and filters server-side for records this player owns.
+app.get("/api/lookup/privateservers/:id", requireModAuth, async (req, res) => {
+  if (!OPEN_CLOUD_API_KEY || !UNIVERSE_ID) {
+    return res.status(404).json({ error: "Live game data isn't configured on this panel." });
+  }
+
+  try {
+    const result = await httpsJSON({
+      hostname: "apis.roblox.com",
+      path: `/datastores/v1/universes/${UNIVERSE_ID}/standard-datastores/datastore/entries/entry?datastoreName=${encodeURIComponent(
+        "PrivateServersV1"
+      )}&entryKey=${encodeURIComponent("AllServers")}`,
+      method: "GET",
+      headers: { "x-api-key": OPEN_CLOUD_API_KEY },
+    });
+
+    if (result.status === 404) {
+      return res.json({ servers: [] });
+    }
+    if (result.status !== 200) {
+      const reason =
+        result.status === 401 || result.status === 403
+          ? "API key missing/invalid, or not scoped to the PrivateServersV1 DataStore."
+          : `Unexpected response (HTTP ${result.status}).`;
+      return res.status(502).json({ error: reason });
+    }
+
+    const all = Array.isArray(result.body) ? result.body : [];
+    const targetId = Number(req.params.id);
+    const owned = all
+      .filter((r) => Number(r.ownerId) === targetId)
+      .map((r) => ({
+        id: r.id, // the game's own join/reserved-server identifier
+        name: r.name || "(unnamed)",
+        createdAt: r.createdAt || null,
+      }));
+
+    res.json({ servers: owned });
+  } catch (err) {
+    console.error("[Sentinel] Private server lookup failed:", err.message);
+    res.status(502).json({ error: "Request failed." });
+  }
 });
 
 // ============================================================
