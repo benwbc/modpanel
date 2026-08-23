@@ -260,7 +260,8 @@
           return `
             <div class="datastore-card">
               <h3>${escapeHtml(ds.label)} <span class="sub" style="margin:0">(${escapeHtml(ds.datastoreName)})</span></h3>
-              <p class="sub" style="margin:4px 0 0">${ds.error ? "Lookup failed." : "No entry for this player."}</p>
+              <p class="sub" style="margin:4px 0 0; ${ds.error ? "color:var(--danger)" : ""}">${ds.error ? escapeHtml(ds.error) : "No entry for this player."}</p>
+              ${ds.error ? `<p class="sub" style="margin:4px 0 0">DataStore name in this config: <code>${escapeHtml(ds.datastoreName)}</code> — double-check it's spelled exactly right and your Open Cloud key has access to it.</p>` : ""}
             </div>`;
         }
         const rows = flattenForDisplay(ds.data, "", []);
@@ -277,6 +278,26 @@
       .join("");
   }
 
+  function renderPrivateServers(servers) {
+    if (!servers.length) {
+      return `<p class="sub" style="margin:0">Doesn't own any private servers.</p>`;
+    }
+    return `
+      <table class="stats-table">
+        <tbody>
+          ${servers
+            .map(
+              (s) => `
+            <tr>
+              <td>${escapeHtml(s.name)}</td>
+              <td>Join code: <code>${escapeHtml(s.id)}</code></td>
+            </tr>`
+            )
+            .join("")}
+        </tbody>
+      </table>`;
+  }
+
   async function doLookup(query) {
     const isNumeric = /^\d+$/.test(query);
     const params = isNumeric ? `userId=${encodeURIComponent(query)}` : `username=${encodeURIComponent(query)}`;
@@ -287,14 +308,22 @@
       const data = await api(`/api/lookup/roblox?${params}`);
       const p = data.profile;
       $("#actionUserId").value = p.id;
+      $("#actionUsername").value = p.name;
 
       let gameDataHtml = "";
+      let privateServersHtml = "";
       if (state.config.gameDataConfigured) {
         try {
           const gd = await api(`/api/lookup/gamedata/${p.id}`);
           gameDataHtml = `<h2 style="margin-top:18px">Stats</h2>${renderDatastoreResults(gd.datastores)}`;
         } catch (e) {
           gameDataHtml = `<h2 style="margin-top:18px">Stats</h2><p class="sub" style="margin:0">Couldn't reach DataStore lookup (${escapeHtml(e.message)}).</p>`;
+        }
+        try {
+          const ps = await api(`/api/lookup/privateservers/${p.id}`);
+          privateServersHtml = `<h2 style="margin-top:18px">Private Servers Owned</h2>${renderPrivateServers(ps.servers)}`;
+        } catch (e) {
+          privateServersHtml = `<h2 style="margin-top:18px">Private Servers Owned</h2><p class="sub" style="margin:0">Couldn't reach lookup (${escapeHtml(e.message)}).</p>`;
         }
       }
 
@@ -316,6 +345,7 @@
             : `<p class="sub" style="margin:0">No violations on record for this player.</p>`
         }
         ${gameDataHtml}
+        ${privateServersHtml}
       `;
     } catch (err) {
       resultEl.innerHTML = `<p class="sub" style="color:var(--danger)">${escapeHtml(err.message)}</p>`;
@@ -327,11 +357,19 @@
     doLookup($("#lookupInput").value.trim());
   });
 
+  // If the UserId is hand-edited after a lookup, the previously-captured
+  // username no longer necessarily matches it — clear it so we don't send
+  // a mismatched username along with a manually-typed UserId.
+  $("#actionUserId").addEventListener("input", () => {
+    $("#actionUsername").value = "";
+  });
+
   $("#actionForm").addEventListener("submit", async (e) => {
     e.preventDefault();
     const body = {
       type: $("#actionType").value,
       userId: $("#actionUserId").value.trim(),
+      username: $("#actionUsername").value.trim(),
       reason: $("#actionReason").value.trim(),
       notes: $("#actionNotes").value.trim(),
       banLength: $("#banLength").value,
@@ -367,7 +405,7 @@
         <div class="feed-row sev-${a.type === "ban" ? "ban" : "warning"}" style="grid-template-columns:90px 1fr 140px 110px">
           <span class="feed-badge sev-${a.type === "ban" ? "ban" : "warning"}">${a.type}</span>
           <div class="feed-main">
-            <span class="player">UserId ${a.userId}</span>
+            <span class="player">${a.username ? escapeHtml(a.username) : `UserId ${a.userId}`}${a.username ? ` <span class="sub" style="margin:0">(${a.userId})</span>` : ""}</span>
             <span class="type">by ${escapeHtml(a.queuedBy)}</span>
             <div class="details">${escapeHtml(a.reason || "")}</div>
           </div>
